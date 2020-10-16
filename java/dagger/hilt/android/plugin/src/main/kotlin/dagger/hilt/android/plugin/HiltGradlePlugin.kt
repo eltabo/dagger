@@ -16,11 +16,20 @@
 
 package dagger.hilt.android.plugin
 
+import com.android.build.gradle.AppExtension
 import com.android.build.gradle.BaseExtension
+import com.android.build.gradle.LibraryExtension
+import com.android.build.gradle.TestExtension
 import com.android.build.gradle.TestedExtension
 import com.android.build.gradle.api.AndroidBasePlugin
+import com.android.build.gradle.api.BaseVariant
+import com.android.build.gradle.api.TestVariant
+import com.android.build.gradle.api.UnitTestVariant
+import com.android.builder.model.AndroidProject
+import dagger.hilt.android.plugin.util.CopyTransform
 import org.gradle.api.Plugin
 import org.gradle.api.Project
+import org.gradle.api.attributes.Attribute
 
 /**
  * A Gradle plugin that checks if the project is an Android project and if so, registers a
@@ -51,8 +60,112 @@ class HiltGradlePlugin : Plugin<Project> {
     val extension = project.extensions.create(
       HiltExtension::class.java, "hilt", HiltExtensionImpl::class.java
     )
+    configureCompileClasspath(project, extension)
     configureTransform(project, extension)
     configureProcessorFlags(project)
+  }
+
+  private fun configureCompileClasspath(project: Project, extension: HiltExtension) {
+    val androidExtension = project.extensions.findByType(BaseExtension::class.java)
+      ?: throw error("Android BaseExtension not found.")
+    when (androidExtension) {
+      is AppExtension -> {
+        // For an app project we configure the app variant and both androidTest and test variants,
+        // Hilt components are generated in all of them.
+        androidExtension.applicationVariants.all {
+          configureVariantCompileClasspath(project, extension, it)
+        }
+        androidExtension.testVariants.all {
+          configureVariantCompileClasspath(project, extension, it)
+        }
+        androidExtension.unitTestVariants.all {
+          configureVariantCompileClasspath(project, extension, it)
+        }
+      }
+      is LibraryExtension -> {
+        // For a library project, only the androidTest and test variant are configured since
+        // Hilt components are not generated in a library.
+        androidExtension.testVariants.all {
+          configureVariantCompileClasspath(project, extension, it)
+        }
+        androidExtension.unitTestVariants.all {
+          configureVariantCompileClasspath(project, extension, it)
+        }
+      }
+      is TestExtension -> {
+        androidExtension.applicationVariants.all {
+          configureVariantCompileClasspath(project, extension, it)
+        }
+      }
+      else -> error(
+        "Hilt plugin is unable to configure the compile classpath for project with extension " +
+          "'$androidExtension'"
+      )
+    }
+
+    // TODO: Remove once lint integration is fixed in AGP 7.0. See b/158753935
+    // Sadly this has to be disabled early and without knowing if
+    // enableExperimentalClasspathAggregation is set to true since this causes issues during
+    // configuration phase.
+    androidExtension.lintOptions.isCheckReleaseBuilds = false
+
+    project.dependencies.apply {
+      registerTransform(CopyTransform::class.java) { spec ->
+        // Java/Kotlin library projects offer an artifact of type 'jar'.
+        spec.from.attribute(ARTIFACT_TYPE_ATTRIBUTE, "jar")
+        // Android library projects (with or without Kotlin) offer an artifact of type
+        // 'android-classes', which AGP can offer as a jar.
+        spec.from.attribute(ARTIFACT_TYPE_ATTRIBUTE, "android-classes-jar")
+        spec.to.attribute(ARTIFACT_TYPE_ATTRIBUTE, DAGGER_ARTIFACT_TYPE_VALUE)
+      }
+    }
+  }
+
+  private fun configureVariantCompileClasspath(
+    project: Project,
+    extension: HiltExtension,
+    variant: BaseVariant
+  ) {
+    if (!extension.enableExperimentalClasspathAggregation) {
+      // Option is not enabled, don't configure compile classpath. Note that the option can't be
+      // checked earlier (before iterating over the variants) since it would have been too early for
+      // the value to be populated from the build file.
+      return
+    }
+
+    if (project.properties.containsKey(AndroidProject.PROPERTY_BUILD_MODEL_ONLY_VERSIONED)) {
+      // Do not configure compile classpath when AndroidStudio is building the model (syncing)
+      // otherwise it will cause a freeze.
+      return
+    }
+
+    val runtimeConfiguration = if (variant is TestVariant) {
+      // For Android test variants, the tested runtime classpath is used since the test app has
+      // tested dependencies removed.
+      variant.testedVariant.runtimeConfiguration
+    } else {
+      variant.runtimeConfiguration
+    }
+    val artifactView = runtimeConfiguration.incoming.artifactView { view ->
+      view.attributes.attribute(ARTIFACT_TYPE_ATTRIBUTE, DAGGER_ARTIFACT_TYPE_VALUE)
+    }
+
+    // CompileOnly config names don't follow the usual convention:
+    // <Variant Name>   -> <Config Name>
+    // debug            -> debugCompileOnly
+    // debugAndroidTest -> androidTestDebugCompileOnly
+    // debugUnitTest    -> testDebugCompileOnly
+    // release          -> releaseCompileOnly
+    // releaseUnitTest  -> testReleaseCompileOnly
+    val compileOnlyConfigName = when (variant) {
+      is TestVariant ->
+        "androidTest${variant.name.substringBeforeLast("AndroidTest").capitalize()}CompileOnly"
+      is UnitTestVariant ->
+        "test${variant.name.substringBeforeLast("UnitTest").capitalize()}CompileOnly"
+      else ->
+        "${variant.name}CompileOnly"
+    }
+    project.dependencies.add(compileOnlyConfigName, artifactView.files)
   }
 
   private fun configureTransform(project: Project, extension: HiltExtension) {
@@ -103,6 +216,9 @@ class HiltGradlePlugin : Plugin<Project> {
   }
 
   companion object {
+    val ARTIFACT_TYPE_ATTRIBUTE = Attribute.of("artifactType", String::class.java)
+    const val DAGGER_ARTIFACT_TYPE_VALUE = "jar-for-dagger"
+
     const val LIBRARY_GROUP = "com.google.dagger"
     val PROCESSOR_OPTIONS = listOf(
       "dagger.fastInit" to "enabled",
